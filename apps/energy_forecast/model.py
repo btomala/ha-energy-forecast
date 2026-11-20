@@ -1010,8 +1010,9 @@ class EnergyForecastModel:
         setpoint_off: float | None = None,
         heating_buffer_temp_recent: pd.DataFrame
         | None = None,  # cols: timestamp, heating_buffer_temp — most recent reading(s)
+        horizon_hours: int = 48,
     ):
-        """Build the 48-hour feature matrix shared by predict() and predict_intervals().
+        """Build the prediction-horizon feature matrix shared by predict() and predict_intervals().
 
         Returns (future_hours, X) where future_hours is a naive DatetimeIndex
         and X is the filled DataFrame ready for model.predict().
@@ -1021,7 +1022,7 @@ class EnergyForecastModel:
 
         self._last_regime_info = {}
         now_naive = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
-        future_hours = pd.date_range(start=now_naive.floor("1h"), periods=48, freq="1h")
+        future_hours = pd.date_range(start=now_naive.floor("1h"), periods=horizon_hours, freq="1h")
 
         future_df = pd.DataFrame({"timestamp": future_hours, "gross_kwh": np.nan})
         future_df = _add_lag_and_rolling_prediction(future_df, recent_actuals)
@@ -1288,9 +1289,10 @@ class EnergyForecastModel:
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
+        horizon_hours: int = 48,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame:
-        """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
+        """Return prediction-horizon DataFrame [timestamp (naive), predicted_kwh]."""
         import numpy as np
         import pandas as pd
 
@@ -1314,6 +1316,7 @@ class EnergyForecastModel:
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
+                horizon_hours=horizon_hours,
             )
         if "thermal_pressure_net" in X.attrs:
             self._latest_thermal_pressure_net = float(X.attrs["thermal_pressure_net"])

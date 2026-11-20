@@ -1020,8 +1020,8 @@ class EnergyForecast(hass.Hass):
             ("tomorrow", "Tomorrow"),
         ]:
             attrs_topic = (
-                f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_today/attributes"
-                if key == "today"
+                f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_{key}/attributes"
+                if key in ("today", "tomorrow")
                 else None
             )
             self._mqtt_publish_discovery(
@@ -2083,9 +2083,11 @@ class EnergyForecast(hass.Hass):
                 recent_actuals, _ = _subtract_sub_sensors(recent_actuals, self._subtract_only_dict(sub_sensors_recent))
 
         live_temp = self._read_live_temp()
-        now_ts = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
-        away_series = self._build_away_prediction_series(now_ts)
-        people_home_series = self._build_people_home_prediction_series(now_ts)
+        now_aware = pd.Timestamp.now(tz=self._timezone)
+        now_ts = now_aware.tz_localize(None)
+        forecast_horizon_hours = _forecast_horizon_hours(now_aware, self._timezone)
+        away_series = self._build_away_prediction_series(now_ts, forecast_horizon_hours)
+        people_home_series = self._build_people_home_prediction_series(now_ts, forecast_horizon_hours)
 
         # ── Stage 2: Climate & DHW Recent Fetch ──────────────────────────────
         climate_recent: dict[str, Any] = {}
@@ -2134,7 +2136,12 @@ class EnergyForecast(hass.Hass):
         if self._heating_active_entity or self._heating_thresholds.label_source == "meter":
             try:
                 heating_active_series, heating_setpoint_on, heating_setpoint_off = (
-                    self._build_heating_active_projection(forecast_df, climate_recent, sub_sensors_recent)
+                    self._build_heating_active_projection(
+                        forecast_df,
+                        climate_recent,
+                        sub_sensors_recent=sub_sensors_recent,
+                        horizon_hours=forecast_horizon_hours,
+                    )
                 )
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Heating active projection failed: %s", exc)
@@ -2167,7 +2174,7 @@ class EnergyForecast(hass.Hass):
         self._cached_heating_active_series = heating_active_series
         self._cached_heating_setpoints = (heating_setpoint_on, heating_setpoint_off)
 
-        # Build the 48h feature matrix once; predict/predict_intervals/shap_summary
+        # Build the prediction-horizon feature matrix once; predict/predict_intervals/shap_summary
         # all receive the pre-computed result to avoid triple feature engineering.
         predict_kwargs = {
             "forecast_df": forecast_df,
@@ -2183,6 +2190,7 @@ class EnergyForecast(hass.Hass):
             "setpoint_on": heating_setpoint_on,
             "setpoint_off": heating_setpoint_off,
             "heating_buffer_temp_recent": self._physics_heating_buffer_df,
+            "horizon_hours": forecast_horizon_hours,
         }
         _capture_snapshot = _snapshot_predict_inputs(self, predict_kwargs, now_ts)
         _prepared = self._ml_model._prepare_prediction_X(
@@ -2245,6 +2253,9 @@ class EnergyForecast(hass.Hass):
                     + _override_delta.reindex(pd.DatetimeIndex(predictions["timestamp"])).fillna(0.0).to_numpy(),
                 )
 
+        predictions["forecast_timestamp"] = _forecast_hour_starts(
+            now_aware, self._timezone, len(predictions)
+        )
         self._publish_thermal_pressure()
 
         intervals = self._ml_model.predict_intervals(
@@ -2392,6 +2403,7 @@ class EnergyForecast(hass.Hass):
             intervals=intervals,
             sub_sensors_recent=sub_sensors_recent or None,
             ev_actuals_df=_ev_actuals_df,
+            forecast_generated_at=now_aware,
         )
         try:
             _now_local = pd.Timestamp.now(self._timezone).tz_localize(None)
@@ -2475,8 +2487,8 @@ class EnergyForecast(hass.Hass):
                 pass
         return result
 
-    def _build_away_prediction_series(self, now_ts: Any) -> Any:
-        """Return a 48-value pd.Series (indexed by naive prediction timestamps) of is_away flags.
+    def _build_away_prediction_series(self, now_ts: Any, horizon_hours: int = 48) -> Any:
+        """Return horizon-sized is_away flags indexed by naive prediction timestamps.
 
         Logic:
         - Entity is "off" (or not configured)  → all zeros.
@@ -2485,7 +2497,7 @@ class EnergyForecast(hass.Hass):
         """
         import pandas as pd
 
-        future_hours = pd.date_range(start=pd.Timestamp(now_ts).floor("1h"), periods=48, freq="1h")
+        future_hours = pd.date_range(start=pd.Timestamp(now_ts).floor("1h"), periods=horizon_hours, freq="1h")
         is_away = pd.Series(0, index=future_hours, dtype=int)
 
         if not self._away_mode_entity:
@@ -2510,23 +2522,23 @@ class EnergyForecast(hass.Hass):
                 return_dt = None
 
         if return_dt is None or return_dt <= pd.Timestamp(now_ts):
-            # No valid return time → away for the whole 48h window
+            # No valid return time → away for the whole prediction window
             is_away[:] = 1
         else:
             is_away[future_hours < return_dt] = 1
 
         return is_away
 
-    def _build_people_home_prediction_series(self, now_ts: Any) -> Any:
-        """Return a 48-value pd.Series (indexed by naive prediction timestamps) of people_home counts.
+    def _build_people_home_prediction_series(self, now_ts: Any, horizon_hours: int = 48) -> Any:
+        """Return horizon-sized people_home counts indexed by naive prediction timestamps.
 
         Counts how many person entities in _presence_sensors are currently in state "home",
-        returns a constant Series with that count replicated across all 48 hours.
+        returns a constant Series with that count replicated across the prediction horizon.
         If no sensors are configured, returns all zeros.
         """
         import pandas as pd
 
-        future_hours = pd.date_range(start=pd.Timestamp(now_ts).floor("1h"), periods=48, freq="1h")
+        future_hours = pd.date_range(start=pd.Timestamp(now_ts).floor("1h"), periods=horizon_hours, freq="1h")
 
         if not self._presence_sensors:
             return pd.Series(0, index=future_hours, dtype=int)
@@ -2576,8 +2588,9 @@ class EnergyForecast(hass.Hass):
         forecast_df: Any,
         climate_recent: dict[str, Any],
         sub_sensors_recent: dict | None = None,
+        horizon_hours: int = 48,
     ) -> tuple[Any, float, float]:
-        """Return (heating_active_series, setpoint_on, setpoint_off) for 48-hour window.
+        """Return (heating_active_series, setpoint_on, setpoint_off) for the prediction horizon.
 
         heating_active_series: pd.Series[int] indexed by naive hourly timestamps (1=heating on).
         setpoint_on/off: live values derived from climate entities when available, else config defaults.
@@ -2617,7 +2630,12 @@ class EnergyForecast(hass.Hass):
             s_on = self._heating_setpoint_on
 
         heating_active_series = heating_season.project_heating_active(
-            now_naive, forecast_df, prior_state, self._heating_thresholds, today_state=today_state
+            now_naive,
+            forecast_df,
+            prior_state,
+            self._heating_thresholds,
+            today_state=today_state,
+            horizon_h=horizon_hours,
         )
         return heating_active_series, float(s_on), float(s_off)
 
@@ -2825,8 +2843,18 @@ class EnergyForecast(hass.Hass):
                     extra["shap_narrative"] = shap_narrative
                 if heating_season_attr is not None:
                     extra["heating_season"] = heating_season_attr
-                if not extra:  # if no attributes, set to None
-                    extra = None
+            if key in ("today", "tomorrow"):
+                if extra is None:
+                    extra = {}
+                extra.update(
+                    {
+                        "provider": "ha_energy_forecast",
+                        "forecast_kind": "consumption",
+                        "forecast_resolution_min": 60,
+                        "forecast_generated_at": data.get("forecast_generated_at"),
+                        "forecast": data.get(f"forecast_{key}", []),
+                    }
+                )
             safe_set(
                 f"sensor.energy_forecast_{key}",
                 data.get(key, 0),
@@ -2834,20 +2862,10 @@ class EnergyForecast(hass.Hass):
                 extra_attrs=extra,
                 icon="mdi:lightning-bolt",
             )
-        # In MQTT mode, publish shap_top_features and shap_narrative as
-        # json_attributes for energy_forecast_today
-        if self._mqtt_discovery and (shap_features or shap_narrative or heating_season_attr is not None):
-            attrs = {}
-            if shap_features:
-                attrs["shap_top_features"] = shap_features
-            if shap_narrative:
-                attrs["shap_narrative"] = shap_narrative
-            if heating_season_attr is not None:
-                attrs["heating_season"] = heating_season_attr
-            if attrs:
+            if self._mqtt_discovery and extra:
                 self._mqtt_publish_sensor_attributes(
-                    "energy_forecast_today",
-                    attrs,
+                    f"energy_forecast_{key}",
+                    extra,
                 )
 
         # ── Prediction intervals (only published when quantile models trained) ─
@@ -3151,11 +3169,19 @@ class EnergyForecast(hass.Hass):
         intervals: Any = None,
         sub_sensors_recent: dict[str, Any] | None = None,
         ev_actuals_df: Any = None,
+        forecast_generated_at: Any = None,
     ) -> dict:
         import numpy as np
         import pandas as pd
 
-        now_dt = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+        now_aware = pd.Timestamp(forecast_generated_at) if forecast_generated_at is not None else pd.Timestamp.now(
+            tz=self._timezone
+        )
+        if now_aware.tzinfo is None:
+            now_aware = now_aware.tz_localize(self._timezone)
+        else:
+            now_aware = now_aware.tz_convert(self._timezone)
+        now_dt = now_aware.tz_localize(None)
         now_np = np.datetime64(now_dt.floor("h"))
         today_np = np.datetime64(now_dt.normalize())
         tomorrow_np = today_np + np.timedelta64(1, "D")
@@ -3207,6 +3233,23 @@ class EnergyForecast(hass.Hass):
             "ev_today": 0.0,
             "ev_yesterday": 0.0,
         }
+
+        # The scalar daily states above intentionally retain their established
+        # semantics.  These timestamped records are a separate EMS interface:
+        # today contains only complete future slots, while tomorrow contains its
+        # full civil day.  The timezone-aware timeline keeps DST transitions
+        # unambiguous (23-hour spring days and 25-hour autumn days).
+        result.update(
+            {
+                "forecast_generated_at": now_aware.isoformat(timespec="seconds"),
+                "forecast_today": _hourly_forecast_records(
+                    predictions, now_aware, self._timezone, day="today"
+                ),
+                "forecast_tomorrow": _hourly_forecast_records(
+                    predictions, now_aware, self._timezone, day="tomorrow"
+                ),
+            }
+        )
 
         # ── Prediction intervals ─────────────────────────────────────────────
         if intervals is not None:
@@ -3775,6 +3818,119 @@ def _blend_today_totals(
         for h in range(0, 24, 3)
     }
     return today_total, blocks
+
+
+def _forecast_horizon_hours(now: Any, timezone: str) -> int:
+    """Return enough native hours to cover the remainder of today and tomorrow.
+
+    Usually this is the existing 48-hour horizon.  It expands to 49 only when
+    one of those civil days contains the extra hour at the autumn DST change,
+    so ``tomorrow.forecast`` can still contain every hour of tomorrow.
+    """
+    import pandas as pd
+
+    first_hour = _forecast_hour_starts(now, timezone, periods=1)[0]
+    now_ts = pd.Timestamp(now)
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.tz_localize(timezone)
+    else:
+        now_ts = now_ts.tz_convert(timezone)
+    end = pd.Timestamp(now_ts.date(), tz=timezone) + pd.DateOffset(days=2)
+    needed = len(pd.date_range(start=first_hour, end=end, freq="1h", inclusive="left"))
+    return max(48, needed)
+
+
+def _forecast_hour_starts(now: Any, timezone: str, periods: int) -> Any:
+    """Return absolute hourly starts for model outputs in the configured timezone.
+
+    The model intentionally works with naive local timestamps.  This companion
+    timeline is used only at the external API boundary, where an offset is
+    essential: a fall-back day has two distinct 02:00 slots and a spring-forward
+    day has no 02:00 slot.  Flooring in UTC avoids pandas' ambiguous-local-time
+    failure during the fall-back hour.
+    """
+    import pandas as pd
+
+    now_ts = pd.Timestamp(now)
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.tz_localize(timezone)
+    else:
+        now_ts = now_ts.tz_convert(timezone)
+    start = now_ts.tz_convert("UTC").floor("h").tz_convert(timezone)
+    return pd.date_range(start=start, periods=periods, freq="1h")
+
+
+def _hourly_forecast_records(predictions: Any, now: Any, timezone: str, day: str) -> list[dict[str, Any]]:
+    """Build timestamp-keyed EMS forecast records for today or tomorrow.
+
+    ``forecast_timestamp`` is carried next to the model's naive timestamp by
+    ``_update_sensors``.  The fallback keeps this helper usable for callers and
+    tests that provide only the historical two-column prediction frame.
+    """
+    import pandas as pd
+
+    if predictions is None or getattr(predictions, "empty", True):
+        return []
+
+    now_ts = pd.Timestamp(now)
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.tz_localize(timezone)
+    else:
+        now_ts = now_ts.tz_convert(timezone)
+
+    if "forecast_timestamp" in predictions.columns:
+        starts = pd.DatetimeIndex(pd.to_datetime(predictions["forecast_timestamp"], utc=True)).tz_convert(timezone)
+    else:
+        starts = _forecast_hour_starts(now_ts, timezone, len(predictions))
+
+    # The model works with naive local timestamps, so it has one prediction for
+    # the local 02:00 label. At the autumn DST change the externally visible
+    # timeline has two distinct 02:00 slots. Look values up by their local wall
+    # time instead of zipping positionally: both 02:00 slots then intentionally
+    # use that one estimate, while 03:00 and every subsequent slot retain their
+    # own correctly aligned prediction.
+    values_by_start: dict[Any, Any] = {}
+    if "timestamp" in predictions.columns:
+        pairs = zip(pd.to_datetime(predictions["timestamp"]), predictions["predicted_kwh"], strict=True)
+        for timestamp, value in pairs:
+            values_by_start.setdefault(pd.Timestamp(timestamp), value)
+
+    # Civil-day boundaries must use a calendar offset rather than 24 elapsed
+    # hours, otherwise a DST transition would include 23 or 25 hours wrongly.
+    today_start = pd.Timestamp(now_ts.date(), tz=timezone)
+    tomorrow_start = today_start + pd.DateOffset(days=1)
+    day_after_tomorrow = tomorrow_start + pd.DateOffset(days=1)
+    if day == "today":
+        window_start, window_end = now_ts, tomorrow_start
+        include_start = False
+    elif day == "tomorrow":
+        window_start, window_end = tomorrow_start, day_after_tomorrow
+        include_start = True
+    else:
+        raise ValueError(f"Unsupported forecast day: {day!r}")
+
+    records: list[dict[str, Any]] = []
+    for start, fallback_value in zip(starts, predictions["predicted_kwh"], strict=True):
+        # For today, do not expose the already-started, incomplete hour.  The
+        # existing daily scalar still includes it, preserving its old meaning.
+        if not ((start >= window_start if include_start else start > window_start) and start < window_end):
+            continue
+        value = values_by_start.get(start.tz_localize(None), fallback_value)
+        try:
+            predicted_kwh = float(value)
+        except (TypeError, ValueError):
+            predicted_kwh = 0.0
+        if math.isnan(predicted_kwh) or math.isinf(predicted_kwh):
+            predicted_kwh = 0.0
+        end = start + pd.Timedelta(hours=1)
+        records.append(
+            {
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "predicted_kwh": round(predicted_kwh, 3),
+            }
+        )
+    return records
 
 
 def _accumulate_pred_history(

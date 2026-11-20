@@ -382,8 +382,8 @@ def build_prediction_inputs(
                 app._heating_temp_on_cfg, app._heating_temp_off_cfg, thresholds
             )
         app._read_live_temp = lambda: live_temp
-        app._build_away_prediction_series = lambda now_ts: None
-        app._build_people_home_prediction_series = lambda now_ts: None
+        app._build_away_prediction_series = lambda now_ts, horizon_hours=48: None
+        app._build_people_home_prediction_series = lambda now_ts, horizon_hours=48: None
         app._ml_model = MagicMock()
         app._ml_model._prepare_prediction_X.side_effect = _grab
         try:

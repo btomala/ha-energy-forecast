@@ -573,8 +573,36 @@ All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engi
 |-----------|-------------|
 | `sensor.energy_forecast_next_1h` | Predicted consumption for the next hour |
 | `sensor.energy_forecast_next_3h` | Predicted consumption for the next 3 hours |
-| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Attributes: `shap_top_features` (top driving features), `shap_narrative` (human-readable explanation, e.g. "Mainly driven by: current outdoor temperature; yesterday's same-hour consumption"). |
-| `sensor.energy_forecast_tomorrow` | Predicted total for tomorrow |
+| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Also exposes the timestamped hourly consumption forecast described below, plus `shap_top_features` and `shap_narrative`. |
+| `sensor.energy_forecast_tomorrow` | Predicted total for tomorrow. Also exposes the timestamped hourly consumption forecast described below. |
+
+### Hourly forecast attribute (EMS)
+
+`sensor.energy_forecast_today` and `sensor.energy_forecast_tomorrow` expose an hourly
+`forecast` attribute for energy-management systems. This is the machine-readable
+interface; the existing 3-hour sensors remain useful for dashboards.
+
+```yaml
+provider: ha_energy_forecast
+forecast_kind: consumption
+forecast_resolution_min: 60
+forecast_generated_at: "2026-11-21T17:01:00+01:00"
+forecast:
+  - start: "2026-11-21T18:00:00+01:00"
+    end: "2026-11-21T19:00:00+01:00"
+    predicted_kwh: 0.82
+```
+
+- `today.forecast` contains only complete future hours; it does not alter the
+  daily state, which continues to include actual consumption for elapsed hours.
+- `tomorrow.forecast` contains the forecast hours belonging to tomorrow.
+- Every `start` and `end` timestamp includes its UTC offset. Consumers must join
+  consumption and price data by `start`/`end`, never by list position; this also
+  distinguishes both 02:00 hours on DST fall-back days.
+- The normal 48-hour model window expands by one record only when needed to
+  cover the 25-hour DST fall-back day in full.
+- Scenario sensors intentionally do not receive this attribute unless a scenario
+  is explicitly published through the Scenario API.
 
 ### Prediction intervals (calibrated 80% coverage)
 

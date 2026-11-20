@@ -28,6 +28,8 @@ from energy_forecast.energy_forecast import (
     _compute_live_mae,
     _ev_mae_excluded_hours,
     _ev_sensor_kwh_by_hour,
+    _forecast_horizon_hours,
+    _hourly_forecast_records,
     _subtract_sub_sensors,
     _tomorrow_local_date,
 )
@@ -459,6 +461,178 @@ class TestAggregate:
         assert result["blocks_today_high"]["06_09"] == pytest.approx(7.0)
         assert result["blocks_today_low"]["00_03"] == pytest.approx(9.0)
         assert result["blocks_today_high"]["21_24"] == pytest.approx(6.0)
+
+
+class TestHourlyForecastAttribute:
+    """Timestamped hourly data exposed for EMS consumers."""
+
+    @staticmethod
+    def _data() -> dict:
+        now = pd.Timestamp("2026-11-21 17:01:00+01:00")
+        starts = pd.date_range(start=pd.Timestamp("2026-11-21 17:00:00+01:00"), periods=48, freq="1h")
+        predictions = pd.DataFrame(
+            {
+                "timestamp": starts.tz_localize(None),
+                "forecast_timestamp": starts,
+                "predicted_kwh": np.arange(48, dtype=float) / 10,
+            }
+        )
+        return {
+            "next_1h": 0.1,
+            "next_3h": 0.6,
+            "today": 12.4,
+            "tomorrow": 20.4,
+            "forecast_generated_at": now.isoformat(),
+            "forecast_today": _hourly_forecast_records(predictions, now, "Europe/Warsaw", "today"),
+            "forecast_tomorrow": _hourly_forecast_records(predictions, now, "Europe/Warsaw", "tomorrow"),
+            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
+        }
+
+    def test_today_and_tomorrow_records_follow_contract(self):
+        data = self._data()
+
+        today = data["forecast_today"]
+        tomorrow = data["forecast_tomorrow"]
+        assert today[0] == {
+            "start": "2026-11-21T18:00:00+01:00",
+            "end": "2026-11-21T19:00:00+01:00",
+            "predicted_kwh": 0.1,
+        }
+        assert len(today) == 6
+        assert len(tomorrow) == 24
+        assert tomorrow[0]["start"] == "2026-11-22T00:00:00+01:00"
+
+    def test_publish_keeps_daily_state_and_adds_hourly_attributes(self):
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+
+        EnergyForecast._publish(fake, self._data())
+
+        state = fake._states["sensor.energy_forecast_today"]
+        attrs = state["attributes"]
+        assert state["state"] == "12.4"
+        assert attrs["provider"] == "ha_energy_forecast"
+        assert attrs["forecast_kind"] == "consumption"
+        assert attrs["forecast_resolution_min"] == 60
+        assert attrs["forecast_generated_at"] == "2026-11-21T17:01:00+01:00"
+        assert attrs["forecast"][0]["start"] == "2026-11-21T18:00:00+01:00"
+        assert len(fake._states["sensor.energy_forecast_tomorrow"]["attributes"]["forecast"]) == 24
+
+    def test_aggregate_uses_captured_generation_time_for_hourly_contract(self):
+        generated_at = pd.Timestamp("2026-11-21 17:01:00", tz="Europe/Zurich")
+        predictions = _pred_df(generated_at.tz_localize(None).floor("1h"), n=48, kwh=1.0)
+        app = _fake_self_for_aggregate()
+
+        with patch("pandas.Timestamp.now", return_value=generated_at):
+            result = EnergyForecast._aggregate(
+                app,
+                predictions,
+                full_actuals=None,
+                live_temp=None,
+                forecast_generated_at=generated_at,
+            )
+
+        assert result["forecast_generated_at"] == "2026-11-21T17:01:00+01:00"
+        assert result["forecast_today"][0]["start"] == "2026-11-21T18:00:00+01:00"
+
+    def test_mqtt_discovery_and_attributes_are_published_for_both_daily_sensors(self):
+        import json
+
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        EnergyForecast._publish(fake, self._data())
+
+        config_topics = {item["topic"] for item in fake._publishes if item["topic"].endswith("/config")}
+        assert "homeassistant/sensor/energy_forecast_today/config" in config_topics
+        assert "homeassistant/sensor/energy_forecast_tomorrow/config" in config_topics
+        config_payloads = {
+            item["topic"]: json.loads(item["payload"])
+            for item in fake._publishes
+            if item["topic"].endswith("/config")
+        }
+        for day in ("today", "tomorrow"):
+            assert config_payloads[f"homeassistant/sensor/energy_forecast_{day}/config"][
+                "json_attributes_topic"
+            ].endswith(f"energy_forecast_{day}/attributes")
+        attribute_payloads = {
+            item["topic"]: json.loads(item["payload"])
+            for item in fake._publishes
+            if item["topic"].endswith("/attributes")
+        }
+        for day in ("today", "tomorrow"):
+            attrs = attribute_payloads[f"homeassistant/energy_forecast/sensor/energy_forecast_{day}/attributes"]
+            assert attrs["forecast_kind"] == "consumption"
+            assert attrs["forecast"]
+
+    def test_dst_records_keep_distinct_fall_back_hours(self):
+        timezone = "Europe/Warsaw"
+        starts = pd.date_range(start=pd.Timestamp("2026-10-25 00:00", tz=timezone), periods=26, freq="1h")
+        predictions = pd.DataFrame({"forecast_timestamp": starts, "predicted_kwh": 1.0})
+
+        records = _hourly_forecast_records(
+            predictions, pd.Timestamp("2026-10-25 00:01", tz=timezone), timezone, "today"
+        )
+
+        repeated = [record for record in records if record["start"].startswith("2026-10-25T02:00")]
+        assert [record["start"] for record in repeated] == [
+            "2026-10-25T02:00:00+02:00",
+            "2026-10-25T02:00:00+01:00",
+        ]
+        assert repeated[0]["end"] == "2026-10-25T02:00:00+01:00"
+
+    def test_fall_back_keeps_values_aligned_after_repeated_hour(self):
+        """The second 02:00 reuses the local-hour estimate without shifting 03:00."""
+        timezone = "Europe/Warsaw"
+        now = pd.Timestamp("2026-10-24 00:01", tz=timezone)
+        model_timestamps = pd.date_range("2026-10-24 00:00", periods=49, freq="1h")
+        native_starts = pd.date_range(model_timestamps[0], periods=49, freq="1h", tz=timezone)
+        predictions = pd.DataFrame(
+            {
+                "timestamp": model_timestamps,
+                "forecast_timestamp": native_starts,
+                "predicted_kwh": np.arange(49, dtype=float),
+            }
+        )
+
+        tomorrow = _hourly_forecast_records(predictions, now, timezone, "tomorrow")
+        values = {record["start"]: record["predicted_kwh"] for record in tomorrow}
+
+        assert values["2026-10-25T02:00:00+02:00"] == 26.0
+        assert values["2026-10-25T02:00:00+01:00"] == 26.0
+        assert values["2026-10-25T03:00:00+01:00"] == 27.0
+
+    def test_dst_records_skip_nonexistent_spring_hour(self):
+        timezone = "Europe/Warsaw"
+        starts = pd.date_range(start=pd.Timestamp("2026-03-29 00:00", tz=timezone), periods=24, freq="1h")
+        predictions = pd.DataFrame({"forecast_timestamp": starts, "predicted_kwh": 1.0})
+
+        records = _hourly_forecast_records(
+            predictions, pd.Timestamp("2026-03-29 00:01", tz=timezone), timezone, "today"
+        )
+
+        assert all("T02:" not in record["start"] for record in records)
+        assert any(
+            record["start"] == "2026-03-29T01:00:00+01:00"
+            and record["end"] == "2026-03-29T03:00:00+02:00"
+            for record in records
+        )
+
+    def test_horizon_expands_for_fall_back_day_to_cover_all_of_tomorrow(self):
+        timezone = "Europe/Warsaw"
+        now = pd.Timestamp("2026-10-24 00:01", tz=timezone)
+        horizon = _forecast_horizon_hours(now, timezone)
+        assert horizon == 49
+        starts = pd.date_range(start=pd.Timestamp("2026-10-24 00:00", tz=timezone), periods=horizon, freq="1h")
+        predictions = pd.DataFrame({"forecast_timestamp": starts, "predicted_kwh": 1.0})
+        tomorrow = _hourly_forecast_records(predictions, now, timezone, "tomorrow")
+
+        assert len(tomorrow) == 25
+        assert [record["start"] for record in tomorrow if "T02:00:00" in record["start"]] == [
+            "2026-10-25T02:00:00+02:00",
+            "2026-10-25T02:00:00+01:00",
+        ]
 
 
 # ── M4 — EV blending consistency ─────────────────────────────────────────────
@@ -4660,15 +4834,15 @@ class _FakeUpdateSensors:
 
         return EnergyForecast._subtract_only_dict(self, sub_dict)
 
-    def _build_away_prediction_series(self, now_ts):
+    def _build_away_prediction_series(self, now_ts, horizon_hours=48):
         from energy_forecast.energy_forecast import EnergyForecast
 
-        return EnergyForecast._build_away_prediction_series(self, now_ts)
+        return EnergyForecast._build_away_prediction_series(self, now_ts, horizon_hours)
 
-    def _build_people_home_prediction_series(self, now_ts):
+    def _build_people_home_prediction_series(self, now_ts, horizon_hours=48):
         from energy_forecast.energy_forecast import EnergyForecast
 
-        return EnergyForecast._build_people_home_prediction_series(self, now_ts)
+        return EnergyForecast._build_people_home_prediction_series(self, now_ts, horizon_hours)
 
     # _publish_thermal_pressure / _aggregate / _publish / _maybe_adaptive_retrain /
     # _save_pred_history are likewise real instance methods with no module-level

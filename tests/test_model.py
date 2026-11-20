@@ -2557,6 +2557,17 @@ class TestHoursAheadFeature:
         actual = X["hours_ahead"].tolist()
         assert actual == expected, f"hours_ahead not monotonic: {actual[:5]}…"
 
+    def test_prediction_horizon_can_expand_for_dst_fall_back(self, tmp_path):
+        """A 49th native hour is supported when civil-day coverage requires it."""
+        m, forecast = _make_trained_model(tmp_path)
+
+        future_hours, X = m._prepare_prediction_X(
+            forecast, live_temp=None, recent_actuals=None, horizon_hours=49
+        )
+
+        assert len(future_hours) == 49
+        assert X["hours_ahead"].tolist() == list(range(49))
+
 
 class TestPreparePredictionXNowNaive:
     """now_naive in _prepare_prediction_X must reflect local wall-clock, not UTC-shifted time."""

@@ -8,6 +8,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `sensor.energy_forecast_today` and `sensor.energy_forecast_tomorrow` now publish
+  an EMS-oriented hourly `forecast` attribute. Each record has offset-bearing
+  `start`/`end` timestamps and `predicted_kwh`, with provider, kind, resolution,
+  and generation-time metadata. The model horizon grows from 48 to 49 records
+  only when necessary to include every hour of a DST fall-back day. The existing
+  daily states and 3-hour sensors are unchanged. MQTT Discovery publishes the
+  attributes for both daily sensors.
+
 ---
 
 ## [0.12.0] - 2026-11-22

@@ -2,7 +2,7 @@
 
 import copy
 import shutil
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -232,6 +232,7 @@ _PREDICT_KWARG_KEYS = {
     "setpoint_on",
     "setpoint_off",
     "heating_buffer_temp_recent",
+    "horizon_hours",
 }
 
 
@@ -270,7 +271,8 @@ def test_published_output_identical_with_flag_on(tmp_path, monkeypatch):
         d = tmp_path / sub
         d.mkdir()
         monkeypatch.setattr(ef_mod, "REGIME_LOG_PATH", d / "regime_log.jsonl")
-        stub = _predict_stub(d, monkeypatch, capture_on=on)
+        with patch("pandas.Timestamp.now", return_value=pd.Timestamp("2026-11-22 21:00:00", tz="Europe/Zurich")):
+            stub = _predict_stub(d, monkeypatch, capture_on=on)
         rec = json.loads((d / "regime_log.jsonl").read_text().splitlines()[0])
         rec.pop("ts")
         return stub.set_state_calls, rec, (d / "pred_history.json").read_text()
@@ -291,7 +293,9 @@ def test_predict_capture_contents(tmp_path, monkeypatch):
     assert set(payload["predict_kwargs"]) == _PREDICT_KWARG_KEYS
     expected = stub._ml_model.predict()
     pd.testing.assert_frame_equal(payload["model_predictions"].reset_index(drop=True), expected)
-    pd.testing.assert_frame_equal(payload["published_predictions"].reset_index(drop=True), expected)
+    published = payload["published_predictions"].reset_index(drop=True)
+    pd.testing.assert_frame_equal(published.drop(columns="forecast_timestamp"), expected)
+    assert str(published["forecast_timestamp"].dt.tz) == "Europe/Zurich"
     assert isinstance(payload["tomorrow_kwh"], float)
     assert payload["now_local"].tzinfo is None
     assert payload["physics_model"] is None
